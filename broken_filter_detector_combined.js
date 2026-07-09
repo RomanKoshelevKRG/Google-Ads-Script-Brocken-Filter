@@ -50,19 +50,34 @@ var SETTINGS = {
   ENABLE_INVENTORY:   true,
   FLAG_ZERO_ELIGIBLE: true,   // flag filters whose products are all NOT_ELIGIBLE
 
-  // ---- Traffic anomaly check ----
+  // ---- Traffic anomaly: PER-FILTER (catches a single filter breaking) ----
   ENABLE_TRAFFIC_ANOMALY:   true,
-  BASELINE_DAYS:            14,
-  RECENT_DAYS:              2,
-  EXCLUDE_TODAY:            true,
-  MIN_BASELINE_IMPRESSIONS: 50,
-  FLAG_STEEP_DROP:          true,
-  STEEP_DROP_RATIO:         0.15,
+  BASELINE_DAYS:            14,     // "was working" window length
+  RECENT_DAYS:              2,      // "check now" window length
+  EXCLUDE_TODAY:            true,   // today's stats are partial
+  MIN_BASELINE_IMPRESSIONS: 50,     // ignore low-volume filters
+  FLAG_STEEP_DROP:          true,   // also flag partial drops (not only ->0)
+  FILTER_DROP_PCT:          0.70,   // flag a filter if its daily rate fell by > this (0.70 = -70%)
+
+  // ---- Traffic anomaly: PER-CAMPAIGN (catches a whole campaign dipping) ----
+  ENABLE_CAMPAIGN_ANOMALY:          true,
+  CAMPAIGN_MIN_BASELINE_IMPRESSIONS: 200,   // ignore tiny campaigns
+  CAMPAIGN_DROP_PCT:                0.30,    // flag a campaign if its daily rate fell by > this (0.30 = -30%)
+  CAMPAIGN_ANOMALY_TAB:            'Campaign Anomalies',
+
+  // ---- Traffic anomaly: PER-ASSET-GROUP / AD-GROUP (one group's products fall out) ----
+  ENABLE_GROUP_ANOMALY:           true,
+  GROUP_MIN_BASELINE_IMPRESSIONS: 50,      // ignore low-volume groups
+  GROUP_DROP_PCT:                 0.70,     // flag a group if its daily rate fell by > this
+  GROUP_ANOMALY_TAB:             'Asset Group Anomalies',
 
   // ---- History & recurrence ----
   ENABLE_HISTORY:     true,   // append a counters row every run
   ENABLE_RECURRING:   true,   // rebuild "which categories break repeatedly"
   RECURRING_MIN_RUNS: 2,      // only list paths flagged in >= N distinct runs
+
+  // ---- Debug ----
+  DEBUG: false,               // true = log baseline/recent impressions per filter & campaign
 };
 // ===========================================================================
 
@@ -77,7 +92,7 @@ function main() {
   if (SETTINGS.INCLUDE_PMAX)     filters = filters.concat(getPmaxFilters(cid));
   if (SETTINGS.INCLUDE_SHOPPING) filters = filters.concat(getShoppingFilters(cid));
   log('Collected ' + filters.length + ' product_type filters.');
-  if (filters.length === 0) { finish([], [], emptyStats(), tz); return; }
+  if (filters.length === 0) { finish([], [], [], [], emptyStats(), tz); return; }
 
   var byCampaign = groupBy(filters, 'campaignResource');
   var campaigns = objectKeys(byCampaign);
@@ -107,12 +122,26 @@ function main() {
   }
   log('Inventory flags: ' + inventoryFlags.length);
 
-  // ---- Traffic anomaly pass ------------------------------------------------
+  // ---- Traffic anomaly pass (per-filter) -----------------------------------
   var anomalyFlags = [];
   if (SETTINGS.ENABLE_TRAFFIC_ANOMALY) {
     anomalyFlags = detectTrafficAnomalies(filters, campaignInventory, tz);
   }
-  log('Traffic anomaly flags: ' + anomalyFlags.length);
+  log('Filter anomaly flags: ' + anomalyFlags.length);
+
+  // ---- Traffic anomaly pass (per-campaign) ---------------------------------
+  var campaignAnomalyFlags = [];
+  if (SETTINGS.ENABLE_CAMPAIGN_ANOMALY) {
+    campaignAnomalyFlags = detectCampaignAnomalies(tz);
+  }
+  log('Campaign anomaly flags: ' + campaignAnomalyFlags.length);
+
+  // ---- Traffic anomaly pass (per-asset-group / ad-group) -------------------
+  var groupAnomalyFlags = [];
+  if (SETTINGS.ENABLE_GROUP_ANOMALY) {
+    groupAnomalyFlags = detectGroupAnomalies(filters, campaignInventory, tz);
+  }
+  log('Group anomaly flags: ' + groupAnomalyFlags.length);
 
   // ---- Stats for the history tab -------------------------------------------
   var stats = {
@@ -123,10 +152,14 @@ function main() {
     invHigh: countBy(inventoryFlags, 'confidence', 'HIGH'),
     invReview: countBy(inventoryFlags, 'confidence', 'REVIEW'),
     anoHigh: countBy(anomalyFlags, 'confidence', 'HIGH'),
-    anoReview: countBy(anomalyFlags, 'confidence', 'REVIEW')
+    anoReview: countBy(anomalyFlags, 'confidence', 'REVIEW'),
+    grpHigh: countBy(groupAnomalyFlags, 'confidence', 'HIGH'),
+    grpReview: countBy(groupAnomalyFlags, 'confidence', 'REVIEW'),
+    campHigh: countBy(campaignAnomalyFlags, 'confidence', 'HIGH'),
+    campReview: countBy(campaignAnomalyFlags, 'confidence', 'REVIEW')
   };
 
-  finish(inventoryFlags, anomalyFlags, stats, tz);
+  finish(inventoryFlags, anomalyFlags, groupAnomalyFlags, campaignAnomalyFlags, stats, tz);
 }
 
 
@@ -157,20 +190,24 @@ function detectTrafficAnomalies(filters, campaignInventory, tz) {
     var f = filters[j];
     var b = baseImp[f.metricKey] || { imp: 0, clk: 0 };
     var r = recImp[f.metricKey]  || { imp: 0, clk: 0 };
+    if (SETTINGS.DEBUG) {
+      log('[filter] ' + f.channel + ' | ' + f.campaignName + ' | ' + f.displayPath +
+          ' | base=' + b.imp + ' recent=' + r.imp + ' key=' + f.metricKey);
+    }
     if (b.imp < SETTINGS.MIN_BASELINE_IMPRESSIONS) continue;
+
+    var basePerDay = b.imp / SETTINGS.BASELINE_DAYS;
+    var recPerDay  = r.imp / SETTINGS.RECENT_DAYS;
+    var dropPct = basePerDay > 0 ? (1 - recPerDay / basePerDay) : 0; // 0..1
 
     var issue = null, conf = null;
     if (r.imp === 0) {
       issue = 'Impressions dropped to 0 (baseline ' + b.imp + ' impr) while campaign & group ENABLED.';
       conf = 'HIGH';
-    } else if (SETTINGS.FLAG_STEEP_DROP) {
-      var basePerDay = b.imp / SETTINGS.BASELINE_DAYS;
-      var recPerDay  = r.imp / SETTINGS.RECENT_DAYS;
-      if (recPerDay < basePerDay * SETTINGS.STEEP_DROP_RATIO) {
-        var pct = Math.round((recPerDay / basePerDay) * 100);
-        issue = 'Steep drop: recent daily rate ~' + pct + '% of baseline (' + b.imp + ' -> ' + r.imp + ' impr).';
-        conf = 'REVIEW';
-      }
+    } else if (SETTINGS.FLAG_STEEP_DROP && dropPct > SETTINGS.FILTER_DROP_PCT) {
+      issue = 'Impressions down ' + Math.round(dropPct * 100) + '% vs baseline daily rate (' +
+              b.imp + ' -> ' + r.imp + ' impr).';
+      conf = 'REVIEW';
     }
     if (!issue) continue;
 
@@ -226,13 +263,224 @@ function getShoppingImpressions(start, end) {
 
 
 /* ===========================================================================
+ *  ASSET-GROUP / AD-GROUP ANOMALY  (one group's products fall out -> 0 impr)
+ *  Uses asset_group / ad_group metrics directly (no fragile per-filter join),
+ *  and annotates each flag with how many of the group's leaf filters now
+ *  match 0 products — i.e. the likely cause.
+ * =========================================================================== */
+
+function detectGroupAnomalies(filters, campaignInventory, tz) {
+  var off = SETTINGS.EXCLUDE_TODAY ? 1 : 0;
+  var recEnd    = daysAgo(off);
+  var recStart  = daysAgo(off + SETTINGS.RECENT_DAYS - 1);
+  var baseEnd   = daysAgo(off + SETTINGS.RECENT_DAYS);
+  var baseStart = daysAgo(off + SETTINGS.RECENT_DAYS + SETTINGS.BASELINE_DAYS - 1);
+  var bS = fmt(baseStart, tz), bE = fmt(baseEnd, tz), rS = fmt(recStart, tz), rE = fmt(recEnd, tz);
+
+  // Inventory rollup per group (also carries campaign/name so we can flag groups
+  // that have NO metrics at all — i.e. dead for the whole window).
+  var groupInv = {};
+  for (var i = 0; i < filters.length; i++) {
+    var f = filters[i];
+    var gk = f.channel + '|' + f.groupId;
+    if (!groupInv[gk]) groupInv[gk] = { leaves: 0, empty: 0, products: 0,
+      channel: f.channel, groupId: f.groupId, name: f.groupName, campaign: f.campaignName };
+    var counts = (campaignInventory[f.campaignResource] || {})[f.pathArray.join(SEP)] || { total: 0 };
+    groupInv[gk].leaves++;
+    groupInv[gk].products += counts.total;
+    if (counts.total === 0) groupInv[gk].empty++;
+  }
+
+  var base = {}, rec = {};
+  mergeInto(base, getGroupMetrics('PMAX', bS, bE));
+  mergeInto(base, getGroupMetrics('SHOPPING', bS, bE));
+  mergeInto(rec,  getGroupMetrics('PMAX', rS, rE));
+  mergeInto(rec,  getGroupMetrics('SHOPPING', rS, rE));
+
+  // Evaluate the UNION of groups seen in metrics and groups that have filters,
+  // so a group that's been at 0 for the whole baseline is still evaluated.
+  var allKeys = {};
+  for (var k1 in base)     { if (base.hasOwnProperty(k1))     allKeys[k1] = true; }
+  for (var k2 in rec)      { if (rec.hasOwnProperty(k2))      allKeys[k2] = true; }
+  for (var k3 in groupInv) { if (groupInv.hasOwnProperty(k3)) allKeys[k3] = true; }
+
+  var flags = [];
+  for (var key in allKeys) {
+    if (!allKeys.hasOwnProperty(key)) continue;
+    var b = base[key] || { imp: 0, clk: 0 };
+    var r = rec[key]  || { imp: 0, clk: 0 };
+    var inv = groupInv[key] || { leaves: 0, empty: 0, products: 0 };
+    var meta = base[key] || groupInv[key] || {};
+    var channel = meta.channel || key.split('|')[0];
+    var name = meta.name || '(unknown group)';
+    var campaign = meta.campaign || '';
+
+    var basePerDay = b.imp / SETTINGS.BASELINE_DAYS;
+    var recPerDay  = r.imp / SETTINGS.RECENT_DAYS;
+    var dropPct = basePerDay > 0 ? (1 - recPerDay / basePerDay) : 0;
+
+    if (SETTINGS.DEBUG) {
+      log('[group] ' + channel + ' | ' + campaign + ' > ' + name +
+          ' | base=' + b.imp + ' recent=' + r.imp + ' emptyLeaves=' + inv.empty + '/' + inv.leaves);
+    }
+
+    var issue = null, conf = null;
+
+    // (A) Drop within the window: had baseline traffic, now 0 / steep drop.
+    if (b.imp >= SETTINGS.GROUP_MIN_BASELINE_IMPRESSIONS) {
+      if (r.imp === 0) {
+        issue = 'Group impressions dropped to 0 (baseline ' + b.imp + ' impr) while ENABLED — products likely fell out.';
+        conf = 'HIGH';
+      } else if (dropPct > SETTINGS.GROUP_DROP_PCT) {
+        issue = 'Group impressions down ' + Math.round(dropPct * 100) + '% vs baseline (' + b.imp + ' -> ' + r.imp + ' impr).';
+        conf = 'REVIEW';
+      }
+    }
+
+    // (B) Timing-independent: currently not serving AND its filters match 0 products.
+    //     Catches groups that have been dead longer than the baseline window
+    //     (exactly the "Eligible but 0 impressions" asset group case).
+    if (!issue && r.imp === 0 && inv.empty > 0) {
+      issue = 'Group is Enabled but has 0 recent impressions, and ' + inv.empty + ' of ' + inv.leaves +
+              ' product_type filter(s) match 0 products — products fell out of this group.';
+      conf = 'HIGH';
+    }
+
+    if (!issue) continue;
+
+    // Annotate cause (unless message already carries it).
+    if (issue.indexOf('match 0 products') === -1 && inv.empty > 0) {
+      issue += (inv.empty === inv.leaves)
+        ? ' All ' + inv.leaves + ' filter(s) in this group now match 0 products.'
+        : ' ' + inv.empty + ' of ' + inv.leaves + ' filter(s) now match 0 products.';
+    }
+
+    flags.push({
+      channel: channel, confidence: conf, campaign: campaign, group: name,
+      baseImp: b.imp, baseClk: b.clk, recImp: r.imp, recClk: r.clk,
+      dropPct: Math.round(dropPct * 100),
+      leaves: inv.leaves, empty: inv.empty, productsNow: inv.products, issue: issue
+    });
+  }
+  return flags;
+}
+
+function getGroupMetrics(channel, start, end) {
+  var map = {};
+  var q;
+  if (channel === 'PMAX') {
+    q = 'SELECT campaign.name, asset_group.id, asset_group.name, metrics.impressions, metrics.clicks ' +
+        'FROM asset_group ' +
+        "WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX' " +
+        "AND campaign.status = 'ENABLED' AND asset_group.status = 'ENABLED' " +
+        "AND segments.date BETWEEN '" + start + "' AND '" + end + "'";
+  } else {
+    q = 'SELECT campaign.name, ad_group.id, ad_group.name, metrics.impressions, metrics.clicks ' +
+        'FROM ad_group ' +
+        "WHERE campaign.advertising_channel_type = 'SHOPPING' " +
+        "AND campaign.status = 'ENABLED' AND ad_group.status = 'ENABLED' " +
+        "AND segments.date BETWEEN '" + start + "' AND '" + end + "'";
+  }
+  var rows;
+  try { rows = AdsApp.search(q); }
+  catch (e) { log('group metrics (' + channel + ') failed: ' + e); return map; }
+  while (rows.hasNext()) {
+    var r = rows.next();
+    var id = channel === 'PMAX' ? String(get(r, 'assetGroup.id')) : String(get(r, 'adGroup.id'));
+    var name = channel === 'PMAX' ? get(r, 'assetGroup.name') : get(r, 'adGroup.name');
+    map[channel + '|' + id] = {
+      channel: channel, groupId: id, name: name, campaign: get(r, 'campaign.name'),
+      imp: Number(get(r, 'metrics.impressions')) || 0,
+      clk: Number(get(r, 'metrics.clicks')) || 0
+    };
+  }
+  return map;
+}
+
+
+/* ===========================================================================
+ *  CAMPAIGN-LEVEL ANOMALY  (catches a whole campaign dipping, any cause)
+ * =========================================================================== */
+
+function detectCampaignAnomalies(tz) {
+  var off = SETTINGS.EXCLUDE_TODAY ? 1 : 0;
+  var recEnd    = daysAgo(off);
+  var recStart  = daysAgo(off + SETTINGS.RECENT_DAYS - 1);
+  var baseEnd   = daysAgo(off + SETTINGS.RECENT_DAYS);
+  var baseStart = daysAgo(off + SETTINGS.RECENT_DAYS + SETTINGS.BASELINE_DAYS - 1);
+  var bS = fmt(baseStart, tz), bE = fmt(baseEnd, tz), rS = fmt(recStart, tz), rE = fmt(recEnd, tz);
+
+  var base = getCampaignMetrics(bS, bE);
+  var rec  = getCampaignMetrics(rS, rE);
+
+  var flags = [];
+  for (var id in base) {
+    if (!base.hasOwnProperty(id)) continue;
+    var b = base[id];
+    var r = rec[id] || { imp: 0, clk: 0, name: b.name, channel: b.channel };
+    if (b.imp < SETTINGS.CAMPAIGN_MIN_BASELINE_IMPRESSIONS) continue;
+
+    var basePerDay = b.imp / SETTINGS.BASELINE_DAYS;
+    var recPerDay  = r.imp / SETTINGS.RECENT_DAYS;
+    var dropPct = basePerDay > 0 ? (1 - recPerDay / basePerDay) : 0;
+
+    if (SETTINGS.DEBUG) {
+      log('[campaign] ' + b.name + ' | base=' + b.imp + ' recent=' + r.imp +
+          ' drop=' + Math.round(dropPct * 100) + '%');
+    }
+
+    var issue = null, conf = null;
+    if (r.imp === 0) {
+      issue = 'Campaign impressions dropped to 0 (baseline ' + b.imp + ' impr) while ENABLED.';
+      conf = 'HIGH';
+    } else if (dropPct > SETTINGS.CAMPAIGN_DROP_PCT) {
+      issue = 'Campaign impressions down ' + Math.round(dropPct * 100) + '% vs baseline daily rate (' +
+              b.imp + ' -> ' + r.imp + ' impr).';
+      conf = 'REVIEW';
+    }
+    if (!issue) continue;
+
+    flags.push({
+      channel: b.channel, confidence: conf, campaign: b.name,
+      baseImp: b.imp, baseClk: b.clk, recImp: r.imp, recClk: r.clk,
+      dropPct: Math.round(dropPct * 100), issue: issue
+    });
+  }
+  return flags;
+}
+
+function getCampaignMetrics(start, end) {
+  var map = {};
+  var q =
+    'SELECT campaign.id, campaign.name, campaign.advertising_channel_type, ' +
+    'metrics.impressions, metrics.clicks FROM campaign ' +
+    "WHERE campaign.advertising_channel_type IN ('PERFORMANCE_MAX','SHOPPING') " +
+    "AND campaign.status = 'ENABLED' " +
+    "AND segments.date BETWEEN '" + start + "' AND '" + end + "'";
+  var rows = AdsApp.search(q);
+  while (rows.hasNext()) {
+    var r = rows.next();
+    var id = String(get(r, 'campaign.id'));
+    var ch = get(r, 'campaign.advertisingChannelType');
+    map[id] = {
+      name: get(r, 'campaign.name'),
+      channel: ch === 'PERFORMANCE_MAX' ? 'PMAX' : 'SHOPPING',
+      imp: Number(get(r, 'metrics.impressions')) || 0,
+      clk: Number(get(r, 'metrics.clicks')) || 0
+    };
+  }
+  return map;
+}
+
+
+/* ===========================================================================
  *  FILTER COLLECTION
  * =========================================================================== */
 
 function getPmaxFilters(cid) {
   var nodes = {}, leaves = [];
   var q =
-    'SELECT campaign.id, campaign.name, asset_group.name, ' +
+    'SELECT campaign.id, campaign.name, asset_group.id, asset_group.name, ' +
     'asset_group_listing_group_filter.type, ' +
     'asset_group_listing_group_filter.case_value.product_type.value, ' +
     'asset_group_listing_group_filter.parent_listing_group_filter ' +
@@ -250,6 +498,7 @@ function getPmaxFilters(cid) {
       value: get(r, 'assetGroupListingGroupFilter.caseValue.productType.value') || null,
       campaignId: String(get(r, 'campaign.id')),
       campaignName: get(r, 'campaign.name'),
+      groupId: String(get(r, 'assetGroup.id')),
       groupName: get(r, 'assetGroup.name')
     };
     nodes[rn] = node;
@@ -257,7 +506,7 @@ function getPmaxFilters(cid) {
   }
   return leaves.map(function (lf) {
     var p = buildPath(lf.resourceName, nodes);
-    return { channel: 'PMAX', metricKey: lf.resourceName,
+    return { channel: 'PMAX', metricKey: lf.resourceName, groupId: lf.groupId,
       campaignResource: 'customers/' + cid + '/campaigns/' + lf.campaignId,
       campaignName: lf.campaignName, groupName: lf.groupName,
       pathArray: p, displayPath: p.join(' > ') };
@@ -283,7 +532,7 @@ function getShoppingFilters(cid) {
     var adGroupId = String(get(r, 'adGroup.id'));
     var rn = 'customers/' + cid + '/adGroupCriteria/' + adGroupId + '~' + critId;
     var node = {
-      resourceName: rn, metricKey: adGroupId + '~' + critId,
+      resourceName: rn, metricKey: adGroupId + '~' + critId, groupId: adGroupId,
       parent: get(r, 'adGroupCriterion.listingGroup.parentAdGroupCriterion'),
       type:  get(r, 'adGroupCriterion.listingGroup.type'),
       value: get(r, 'adGroupCriterion.listingGroup.caseValue.productType.value') || null,
@@ -296,7 +545,7 @@ function getShoppingFilters(cid) {
   }
   return leaves.map(function (lf) {
     var p = buildPath(lf.resourceName, nodes);
-    return { channel: 'SHOPPING', metricKey: lf.metricKey,
+    return { channel: 'SHOPPING', metricKey: lf.metricKey, groupId: lf.groupId,
       campaignResource: 'customers/' + cid + '/campaigns/' + lf.campaignId,
       campaignName: lf.campaignName, groupName: lf.groupName,
       pathArray: p, displayPath: p.join(' > ') };
@@ -350,8 +599,14 @@ var INV_HEADERS = ['Run Date','Channel','Confidence','Campaign','Asset Group / A
 var ANO_HEADERS = ['Run Date','Channel','Confidence','Campaign','Asset Group / Ad Group',
   'Product Type Path','Baseline Impr','Baseline Clicks','Recent Impr','Recent Clicks',
   'Products Matching Now','Eligible Now','Issue'];
+var GRP_HEADERS = ['Run Date','Channel','Confidence','Campaign','Asset Group / Ad Group',
+  'Baseline Impr','Recent Impr','Drop %','Leaf Filters','Empty Leaves (0 products)',
+  'Products Matching Now','Issue'];
+var CAMP_HEADERS = ['Run Date','Channel','Confidence','Campaign','Baseline Impr','Recent Impr',
+  'Drop %','Baseline Clicks','Recent Clicks','Issue'];
 var HIST_HEADERS = ['Run Date','Filters Checked','Campaigns','PMax Filters','Shopping Filters',
-  'Inv HIGH','Inv REVIEW','Anomaly HIGH','Anomaly REVIEW','Total Flags'];
+  'Inv HIGH','Inv REVIEW','Filter Anom HIGH','Filter Anom REVIEW',
+  'Group Anom HIGH','Group Anom REVIEW','Camp Anom HIGH','Camp Anom REVIEW','Total Flags'];
 var REC_HEADERS = ['Channel','Campaign','Asset Group / Ad Group','Product Type Path',
   'Times Flagged (runs)','Last Seen','Last Confidence'];
 
@@ -361,7 +616,7 @@ function invRow(f, counts, conf, issue) {
     total: counts.total, eligible: counts.eligible, issue: issue };
 }
 
-function finish(inventoryFlags, anomalyFlags, stats, tz) {
+function finish(inventoryFlags, anomalyFlags, groupAnomalyFlags, campaignAnomalyFlags, stats, tz) {
   var ss = getSpreadsheet();
   var runDate = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm');
 
@@ -370,23 +625,37 @@ function finish(inventoryFlags, anomalyFlags, stats, tz) {
       return [runDate, f.channel, f.confidence, f.campaign, f.group, f.path, f.level, f.total, f.eligible, f.issue];
     }));
   }
+  if (SETTINGS.ENABLE_GROUP_ANOMALY && groupAnomalyFlags.length > 0) {
+    appendRows(ss, SETTINGS.GROUP_ANOMALY_TAB, GRP_HEADERS, groupAnomalyFlags.map(function (f) {
+      return [runDate, f.channel, f.confidence, f.campaign, f.group, f.baseImp, f.recImp,
+        f.dropPct + '%', f.leaves, f.empty, f.productsNow, f.issue];
+    }));
+  }
   if (SETTINGS.ENABLE_TRAFFIC_ANOMALY && anomalyFlags.length > 0) {
     appendRows(ss, SETTINGS.ANOMALY_TAB, ANO_HEADERS, anomalyFlags.map(function (f) {
       return [runDate, f.channel, f.confidence, f.campaign, f.group, f.path,
         f.baseImp, f.baseClk, f.recImp, f.recClk, f.productsNow, f.eligibleNow, f.issue];
     }));
   }
+  if (SETTINGS.ENABLE_CAMPAIGN_ANOMALY && campaignAnomalyFlags.length > 0) {
+    appendRows(ss, SETTINGS.CAMPAIGN_ANOMALY_TAB, CAMP_HEADERS, campaignAnomalyFlags.map(function (f) {
+      return [runDate, f.channel, f.confidence, f.campaign, f.baseImp, f.recImp,
+        f.dropPct + '%', f.baseClk, f.recClk, f.issue];
+    }));
+  }
   if (SETTINGS.ENABLE_HISTORY) writeHistory(ss, stats, runDate);
   if (SETTINGS.ENABLE_RECURRING) rebuildRecurring(ss);
 
-  sendEmail(ss, inventoryFlags, anomalyFlags);
+  sendEmail(ss, inventoryFlags, groupAnomalyFlags, anomalyFlags, campaignAnomalyFlags);
   log('Done. Sheet: ' + ss.getUrl());
 }
 
 function writeHistory(ss, s, runDate) {
+  var total = s.invHigh + s.invReview + s.anoHigh + s.anoReview +
+              s.grpHigh + s.grpReview + s.campHigh + s.campReview;
   var row = [runDate, s.filters, s.campaigns, s.pmax, s.shopping,
     s.invHigh, s.invReview, s.anoHigh, s.anoReview,
-    s.invHigh + s.invReview + s.anoHigh + s.anoReview];
+    s.grpHigh, s.grpReview, s.campHigh, s.campReview, total];
   appendRows(ss, SETTINGS.HISTORY_TAB, HIST_HEADERS, [row]);
 }
 
@@ -438,23 +707,34 @@ function appendRows(ss, tabName, headers, rows) {
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
 }
 
-function sendEmail(ss, invFlags, anoFlags) {
-  var total = invFlags.length + anoFlags.length;
+function sendEmail(ss, invFlags, grpFlags, anoFlags, campFlags) {
+  var total = invFlags.length + grpFlags.length + anoFlags.length + campFlags.length;
   if (total === 0 && SETTINGS.EMAIL_ONLY_WHEN_ISSUES) return;
   if (!SETTINGS.EMAIL || SETTINGS.EMAIL.indexOf('INSERT') === 0) { log('No EMAIL set — skipping.'); return; }
 
   var acct = AdsApp.currentAccount().getName() + ' (' + AdsApp.currentAccount().getCustomerId() + ')';
-  var subject = '[Google Ads] ' + invFlags.length + ' empty filter(s), ' +
-                anoFlags.length + ' traffic anomaly(ies) — ' + acct;
+  var subject = '[Google Ads] ' + invFlags.length + ' empty filter(s), ' + grpFlags.length +
+                ' group drop(s), ' + campFlags.length + ' campaign drop(s) — ' + acct;
 
   var html = '<div style="font-family:Arial,sans-serif;font-size:13px;color:#222">';
   html += '<p>Account: <b>' + esc(acct) + '</b></p>';
+
   html += '<h3 style="margin:14px 0 4px">Empty / broken filters (inventory) — ' + invFlags.length + '</h3>';
   html += flagTable(invFlags, ['confidence','channel','campaign','group','path','total','eligible','issue'],
     ['Conf.','Channel','Campaign','Group','Product Type','Matching','Eligible','Issue']);
-  html += '<h3 style="margin:18px 0 4px">Traffic anomalies — ' + anoFlags.length + '</h3>';
+
+  html += '<h3 style="margin:18px 0 4px">Asset Group / Ad Group drops — ' + grpFlags.length + '</h3>';
+  html += flagTable(grpFlags, ['confidence','channel','campaign','group','baseImp','recImp','dropPct','empty','leaves','issue'],
+    ['Conf.','Channel','Campaign','Group','Base impr','Recent impr','Drop %','Empty leaves','Leaves','Issue']);
+
+  html += '<h3 style="margin:18px 0 4px">Campaign drops — ' + campFlags.length + '</h3>';
+  html += flagTable(campFlags, ['confidence','channel','campaign','baseImp','recImp','dropPct','issue'],
+    ['Conf.','Channel','Campaign','Base impr','Recent impr','Drop %','Issue']);
+
+  html += '<h3 style="margin:18px 0 4px">Individual filter drops — ' + anoFlags.length + '</h3>';
   html += flagTable(anoFlags, ['confidence','channel','campaign','group','path','baseImp','recImp','productsNow','issue'],
     ['Conf.','Channel','Campaign','Group','Product Type','Base impr','Recent impr','Products now','Issue']);
+
   html += '<p style="margin-top:14px"><a href="' + ss.getUrl() + '">Open the full log →</a></p></div>';
   MailApp.sendEmail({ to: SETTINGS.EMAIL, subject: subject, htmlBody: html });
   log('Email sent to ' + SETTINGS.EMAIL);
@@ -506,7 +786,8 @@ function buildPath(resourceName, nodes) {
 
 function emptyStats() {
   return { filters: 0, campaigns: 0, pmax: 0, shopping: 0,
-    invHigh: 0, invReview: 0, anoHigh: 0, anoReview: 0 };
+    invHigh: 0, invReview: 0, anoHigh: 0, anoReview: 0,
+    grpHigh: 0, grpReview: 0, campHigh: 0, campReview: 0 };
 }
 function countBy(arr, field, value) {
   var n = 0; for (var i = 0; i < arr.length; i++) { if (arr[i][field] === value) n++; } return n;
