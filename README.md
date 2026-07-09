@@ -227,6 +227,4 @@ Read-only. The script uses only `AdsApp.search` (GAQL SELECT queries) against Go
 - **v2** — Added **Run History** and **Recurring Breakages** tabs.
 - **v1** — Inventory (0-products) snapshot + per-filter traffic anomaly.
 
-## License
 
-MIT (replace with your actual license text before publishing).
