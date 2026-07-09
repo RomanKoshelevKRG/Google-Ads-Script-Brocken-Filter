@@ -43,12 +43,20 @@ var SETTINGS = {
   EMAIL:                  'INSERT_EMAIL',       // comma-separate for multiple
   EMAIL_ONLY_WHEN_ISSUES: true,
 
+  // ---- Email content (the Sheet always logs everything; these only trim the email) ----
+  EMAIL_SHOW_INVENTORY:      true,   // include Empty Filters Snapshot in the email
+  EMAIL_INVENTORY_HIGH_ONLY: true,   // ...but only HIGH rows (skip REVIEW / 0-eligible)
+  EMAIL_SHOW_CAMPAIGN_DROPS: true,   // include campaign traffic drops
+  EMAIL_SHOW_GROUP_DROPS:    false,  // include asset group / ad group drops
+  EMAIL_SHOW_FILTER_DROPS:   false,  // include individual filter drops
+
   INCLUDE_PMAX:     true,
   INCLUDE_SHOPPING: true,
 
   // ---- Inventory check ----
   ENABLE_INVENTORY:   true,
   FLAG_ZERO_ELIGIBLE: true,   // flag filters whose products are all NOT_ELIGIBLE
+  NORMALIZE_PRODUCT_TYPE: true, // trim + lowercase when matching (feed has mixed case, e.g. "ліхтарі" vs "Ліхтарі")
 
   // ---- Traffic anomaly: PER-FILTER (catches a single filter breaking) ----
   ENABLE_TRAFFIC_ANOMALY:   true,
@@ -107,9 +115,13 @@ function main() {
 
     if (SETTINGS.ENABLE_INVENTORY) {
       var cf = byCampaign[campRes];
+      var seenInv = {}; // dedup: one row per group + product_type path
       for (var i = 0; i < cf.length; i++) {
         var f = cf[i];
-        var counts = prefixCounts[f.pathArray.join(SEP)] || { total: 0, eligible: 0 };
+        var dedupKey = f.groupId + '|' + pathKey(f.pathArray);
+        if (seenInv[dedupKey]) continue;
+        seenInv[dedupKey] = true;
+        var counts = prefixCounts[pathKey(f.pathArray)] || { total: 0, eligible: 0 };
         if (counts.total === 0) {
           inventoryFlags.push(invRow(f, counts, 'HIGH',
             'Filter matches 0 products — product_type path not in the campaign feed (likely renamed/moved).'));
@@ -211,7 +223,7 @@ function detectTrafficAnomalies(filters, campaignInventory, tz) {
     }
     if (!issue) continue;
 
-    var inv = (campaignInventory[f.campaignResource] || {})[f.pathArray.join(SEP)] || { total: 0, eligible: 0 };
+    var inv = (campaignInventory[f.campaignResource] || {})[pathKey(f.pathArray)] || { total: 0, eligible: 0 };
     flags.push({
       channel: f.channel, confidence: conf,
       campaign: f.campaignName, group: f.groupName, path: f.displayPath,
@@ -283,9 +295,12 @@ function detectGroupAnomalies(filters, campaignInventory, tz) {
   for (var i = 0; i < filters.length; i++) {
     var f = filters[i];
     var gk = f.channel + '|' + f.groupId;
-    if (!groupInv[gk]) groupInv[gk] = { leaves: 0, empty: 0, products: 0,
+    if (!groupInv[gk]) groupInv[gk] = { leaves: 0, empty: 0, products: 0, seen: {},
       channel: f.channel, groupId: f.groupId, name: f.groupName, campaign: f.campaignName };
-    var counts = (campaignInventory[f.campaignResource] || {})[f.pathArray.join(SEP)] || { total: 0 };
+    var pk = pathKey(f.pathArray);
+    if (groupInv[gk].seen[pk]) continue;       // count each product_type path once
+    groupInv[gk].seen[pk] = true;
+    var counts = (campaignInventory[f.campaignResource] || {})[pk] || { total: 0 };
     groupInv[gk].leaves++;
     groupInv[gk].products += counts.total;
     if (counts.total === 0) groupInv[gk].empty++;
@@ -502,15 +517,22 @@ function getPmaxFilters(cid) {
       groupName: get(r, 'assetGroup.name')
     };
     nodes[rn] = node;
-    if (node.type === 'UNIT_INCLUDED' && node.value) leaves.push(node);
+    // Collect EVERY serving leaf (UNIT_INCLUDED), not only product_type units.
+    // The product_type constraint may be inherited from ancestor subdivisions,
+    // while the leaf itself is split by brand or is an "everything else" node.
+    if (node.type === 'UNIT_INCLUDED') leaves.push(node);
   }
-  return leaves.map(function (lf) {
-    var p = buildPath(lf.resourceName, nodes);
-    return { channel: 'PMAX', metricKey: lf.resourceName, groupId: lf.groupId,
+  var out = [];
+  for (var li = 0; li < leaves.length; li++) {
+    var lf = leaves[li];
+    var p = buildPath(lf.resourceName, nodes); // inherited product_type path
+    if (p.length === 0) continue;              // no product_type constraint -> skip
+    out.push({ channel: 'PMAX', metricKey: lf.resourceName, groupId: lf.groupId,
       campaignResource: 'customers/' + cid + '/campaigns/' + lf.campaignId,
       campaignName: lf.campaignName, groupName: lf.groupName,
-      pathArray: p, displayPath: p.join(' > ') };
-  });
+      pathArray: p, displayPath: p.join(' > ') });
+  }
+  return out;
 }
 
 function getShoppingFilters(cid) {
@@ -541,15 +563,19 @@ function getShoppingFilters(cid) {
       groupName: get(r, 'adGroup.name')
     };
     nodes[rn] = node;
-    if (node.type === 'UNIT' && node.value) leaves.push(node);
+    if (node.type === 'UNIT') leaves.push(node); // every serving leaf, any dimension
   }
-  return leaves.map(function (lf) {
+  var out = [];
+  for (var li = 0; li < leaves.length; li++) {
+    var lf = leaves[li];
     var p = buildPath(lf.resourceName, nodes);
-    return { channel: 'SHOPPING', metricKey: lf.metricKey, groupId: lf.groupId,
+    if (p.length === 0) continue;
+    out.push({ channel: 'SHOPPING', metricKey: lf.metricKey, groupId: lf.groupId,
       campaignResource: 'customers/' + cid + '/campaigns/' + lf.campaignId,
       campaignName: lf.campaignName, groupName: lf.groupName,
-      pathArray: p, displayPath: p.join(' > ') };
-  });
+      pathArray: p, displayPath: p.join(' > ') });
+  }
+  return out;
 }
 
 
@@ -580,7 +606,7 @@ function getCampaignInventory(campaignResource) {
     for (var lvl = 0; lvl < levels.length; lvl++) {
       if (!levels[lvl]) break;
       parts.push(levels[lvl]);
-      var key = parts.join(SEP);
+      var key = pathKey(parts); // normalized to match filter paths
       if (!prefixCounts[key]) prefixCounts[key] = { total: 0, eligible: 0 };
       prefixCounts[key].total++;
       if (isEligible) prefixCounts[key].eligible++;
@@ -708,36 +734,61 @@ function appendRows(ss, tabName, headers, rows) {
 }
 
 function sendEmail(ss, invFlags, grpFlags, anoFlags, campFlags) {
-  var total = invFlags.length + grpFlags.length + anoFlags.length + campFlags.length;
-  if (total === 0 && SETTINGS.EMAIL_ONLY_WHEN_ISSUES) return;
   if (!SETTINGS.EMAIL || SETTINGS.EMAIL.indexOf('INSERT') === 0) { log('No EMAIL set — skipping.'); return; }
 
+  // Decide what the email will actually show (the Sheet still logs everything).
+  var invShown = SETTINGS.EMAIL_INVENTORY_HIGH_ONLY ? filterByConfidence(invFlags, 'HIGH') : invFlags;
+  var showInv  = SETTINGS.EMAIL_SHOW_INVENTORY;
+  var showCamp = SETTINGS.EMAIL_SHOW_CAMPAIGN_DROPS;
+  var showGrp  = SETTINGS.EMAIL_SHOW_GROUP_DROPS;
+  var showFil  = SETTINGS.EMAIL_SHOW_FILTER_DROPS;
+
+  var emailedTotal = (showInv ? invShown.length : 0) + (showCamp ? campFlags.length : 0) +
+                     (showGrp ? grpFlags.length : 0) + (showFil ? anoFlags.length : 0);
+  if (emailedTotal === 0 && SETTINGS.EMAIL_ONLY_WHEN_ISSUES) return;
+
   var acct = AdsApp.currentAccount().getName() + ' (' + AdsApp.currentAccount().getCustomerId() + ')';
-  var subject = '[Google Ads] ' + invFlags.length + ' empty filter(s), ' + grpFlags.length +
-                ' group drop(s), ' + campFlags.length + ' campaign drop(s) — ' + acct;
+  var subject = '[Google Ads] ' + (showInv ? invShown.length : 0) + ' broken filter(s), ' +
+                (showCamp ? campFlags.length : 0) + ' campaign drop(s) — ' + acct;
 
   var html = '<div style="font-family:Arial,sans-serif;font-size:13px;color:#222">';
   html += '<p>Account: <b>' + esc(acct) + '</b></p>';
 
-  html += '<h3 style="margin:14px 0 4px">Empty / broken filters (inventory) — ' + invFlags.length + '</h3>';
-  html += flagTable(invFlags, ['confidence','channel','campaign','group','path','total','eligible','issue'],
-    ['Conf.','Channel','Campaign','Group','Product Type','Matching','Eligible','Issue']);
+  if (showInv) {
+    html += '<h3 style="margin:14px 0 4px">Broken filters — 0 products (HIGH) — ' + invShown.length + '</h3>';
+    html += flagTable(invShown, ['channel','campaign','group','path','total','issue'],
+      ['Channel','Campaign','Group','Product Type','Matching','Issue']);
+  }
+  if (showCamp) {
+    html += '<h3 style="margin:18px 0 4px">Campaign traffic drops — ' + campFlags.length + '</h3>';
+    html += flagTable(campFlags, ['confidence','channel','campaign','baseImp','recImp','dropPct','issue'],
+      ['Conf.','Channel','Campaign','Base impr','Recent impr','Drop %','Issue']);
+  }
+  if (showGrp) {
+    html += '<h3 style="margin:18px 0 4px">Asset Group / Ad Group drops — ' + grpFlags.length + '</h3>';
+    html += flagTable(grpFlags, ['confidence','channel','campaign','group','baseImp','recImp','dropPct','empty','leaves','issue'],
+      ['Conf.','Channel','Campaign','Group','Base impr','Recent impr','Drop %','Empty leaves','Leaves','Issue']);
+  }
+  if (showFil) {
+    html += '<h3 style="margin:18px 0 4px">Individual filter drops — ' + anoFlags.length + '</h3>';
+    html += flagTable(anoFlags, ['confidence','channel','campaign','group','path','baseImp','recImp','productsNow','issue'],
+      ['Conf.','Channel','Campaign','Group','Product Type','Base impr','Recent impr','Products now','Issue']);
+  }
 
-  html += '<h3 style="margin:18px 0 4px">Asset Group / Ad Group drops — ' + grpFlags.length + '</h3>';
-  html += flagTable(grpFlags, ['confidence','channel','campaign','group','baseImp','recImp','dropPct','empty','leaves','issue'],
-    ['Conf.','Channel','Campaign','Group','Base impr','Recent impr','Drop %','Empty leaves','Leaves','Issue']);
+  // Prominent link to the complete report (all tabs, incl. hidden-from-email sections).
+  html += '<p style="margin-top:16px;padding:10px;background:#f2f6ff;border:1px solid #cfe0ff;border-radius:6px">' +
+          '&#128202; <b>Full report</b> — all tabs (empty filters incl. REVIEW, asset-group &amp; filter drops, run history, recurring breakages):<br>' +
+          '<a href="' + ss.getUrl() + '" style="font-size:14px">Open the full Google Sheet report &rarr;</a></p>';
+  html += '</div>';
 
-  html += '<h3 style="margin:18px 0 4px">Campaign drops — ' + campFlags.length + '</h3>';
-  html += flagTable(campFlags, ['confidence','channel','campaign','baseImp','recImp','dropPct','issue'],
-    ['Conf.','Channel','Campaign','Base impr','Recent impr','Drop %','Issue']);
-
-  html += '<h3 style="margin:18px 0 4px">Individual filter drops — ' + anoFlags.length + '</h3>';
-  html += flagTable(anoFlags, ['confidence','channel','campaign','group','path','baseImp','recImp','productsNow','issue'],
-    ['Conf.','Channel','Campaign','Group','Product Type','Base impr','Recent impr','Products now','Issue']);
-
-  html += '<p style="margin-top:14px"><a href="' + ss.getUrl() + '">Open the full log →</a></p></div>';
   MailApp.sendEmail({ to: SETTINGS.EMAIL, subject: subject, htmlBody: html });
-  log('Email sent to ' + SETTINGS.EMAIL);
+  log('Email sent to ' + SETTINGS.EMAIL + ' (' + emailedTotal + ' items shown).');
+}
+
+function filterByConfidence(flags, conf) {
+  var out = [];
+  for (var i = 0; i < flags.length; i++) { if (flags[i].confidence === conf) out.push(flags[i]); }
+  return out;
 }
 
 function flagTable(flags, fields, headers) {
@@ -782,6 +833,20 @@ function buildPath(resourceName, nodes) {
     guard++;
   }
   return parts;
+}
+
+// Normalize a product_type value for matching (feed values have mixed case/spacing).
+function norm(s) {
+  if (s == null) return '';
+  s = String(s);
+  return SETTINGS.NORMALIZE_PRODUCT_TYPE ? s.replace(/^\s+|\s+$/g, '').toLowerCase() : s;
+}
+
+// Build the (normalized) lookup key for a product_type path array.
+function pathKey(arr) {
+  var out = [];
+  for (var i = 0; i < arr.length; i++) out.push(norm(arr[i]));
+  return out.join(SEP);
 }
 
 function emptyStats() {

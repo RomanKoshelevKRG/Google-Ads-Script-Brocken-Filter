@@ -48,7 +48,7 @@ Each group flag is annotated with `Leaf Filters`, `Empty Leaves (0 products)`, a
 5. **Run History** — one row per run with aggregate counters for every signal (`Inv HIGH/REVIEW, Filter Anom HIGH/REVIEW, Group Anom HIGH/REVIEW, Camp Anom HIGH/REVIEW, Total Flags`). Chart it to see trend over time.
 6. **Recurring Breakages** — rebuilt each run from the Snapshot tab: which `Campaign → Group → Product Type Path` combos were flagged across **multiple runs**, sorted by frequency. Surfaces categories that break again and again.
 
-An **email** with all four flag tables + a sheet link is sent when issues are found (configurable).
+An **email** is sent when issues are found. By default it's kept lean — only **broken filters (HIGH)** and **campaign traffic drops**, plus a prominent link to the full Sheet (which still logs *everything*: REVIEW items, group drops, filter drops, history, recurrence). Email content is fully configurable (see [Email content](#email-content)).
 
 Confidence levels: **HIGH** = broken (0 products / dropped to 0). **REVIEW** = worth a look (products exist but 0 eligible, or a steep partial drop).
 
@@ -99,11 +99,26 @@ All settings live in the `SETTINGS` block at the top of the script.
 | `INCLUDE_PMAX` / `INCLUDE_SHOPPING` | `true` | Which channels to scan. |
 | `DEBUG` | `false` | Log baseline/recent impressions & empty-leaf counts per filter, group, and campaign. |
 
+### Email content
+The Google Sheet always logs **everything**; these flags only control what the *email* contains.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `EMAIL_ONLY_WHEN_ISSUES` | `true` | `false` = always send, even with nothing to report. Gated on what the email will actually show. |
+| `EMAIL_SHOW_INVENTORY` | `true` | Include the Empty Filters Snapshot section. |
+| `EMAIL_INVENTORY_HIGH_ONLY` | `true` | Show only HIGH (0-products) rows; skip REVIEW / 0-eligible. |
+| `EMAIL_SHOW_CAMPAIGN_DROPS` | `true` | Include campaign traffic drops. |
+| `EMAIL_SHOW_GROUP_DROPS` | `false` | Include asset group / ad group drops. |
+| `EMAIL_SHOW_FILTER_DROPS` | `false` | Include individual filter drops. |
+
+Default email = **broken filters (HIGH)** + **campaign drops** + **a link to the full report**.
+
 ### Inventory (structural)
 | Setting | Default | Purpose |
 |---|---|---|
 | `ENABLE_INVENTORY` | `true` | Turn the 0-products check on/off. |
 | `FLAG_ZERO_ELIGIBLE` | `true` | Also flag filters where products exist but all are `NOT_ELIGIBLE`. |
+| `NORMALIZE_PRODUCT_TYPE` | `true` | Match `product_type` case- and whitespace-insensitively (feed has mixed case, e.g. `ліхтарі` vs `Ліхтарі`). |
 
 ### Traffic — per-filter
 | Setting | Default | Purpose |
@@ -143,7 +158,7 @@ Baseline and recent windows are **non-overlapping** by design (baseline = the pe
 
 ## How it works (internals)
 
-1. **Collect filters.** Reads `asset_group_listing_group_filter` (PMax) and `product_group_view` (Shopping) for all *enabled* leaf nodes that include by `product_type`. Rebuilds the full path (`L1 > L2 > …`) by walking parent nodes. Each filter carries its group id for group-level rollups.
+1. **Collect filters.** Reads `asset_group_listing_group_filter` (PMax) and `product_group_view` (Shopping) for **every** enabled serving leaf (`UNIT_INCLUDED` / `UNIT`), not only ones whose own dimension is `product_type`. It rebuilds each leaf's **inherited** `product_type` path (`L1 > L2 > …`) by walking parent subdivisions — so a leaf split by *brand* (or an *"Everything else"* node) sitting under `product_type` subdivisions is still checked against its inherited category. Leaves with no `product_type` ancestor are skipped; duplicate group+path leaves are de-duplicated. Each filter carries its group id for group-level rollups.
 2. **Read inventory per campaign.** For each campaign, queries `shopping_product` scoped to it and counts products per `product_type` **prefix**, so any filter depth can be matched directly. Per-campaign scoping keeps feeds/languages separate.
 3. **Inventory flags.** Filter matches 0 products → broken; optional 0-eligible check.
 4. **Group check.** Pulls `asset_group` / `ad_group` impressions for baseline & recent, rolls up each group's empty-filter count from step 2, and flags drops **and** timing-independent "Enabled + 0 impressions + empty filters".
@@ -154,7 +169,8 @@ Baseline and recent windows are **non-overlapping** by design (baseline = the pe
 
 ## Assumptions & limitations
 
-- **Product-type trees.** Assumes listing-group trees subdivide by `product_type`. Nodes subdividing by brand / custom label are skipped for path building.
+- **Inherited product_type path.** The tool matches each serving leaf against the `product_type` path inherited from its ancestor subdivisions. This correctly catches the common case where an asset group subdivides by `product_type` and the serving leaf is a *brand* / *"Everything else"* node (e.g. `All products › додаткове спорядження › ліхтарі › Brand: Everything else`).
+- **Brand-specific leaves.** If a leaf pins a *specific* brand under a product_type, the check looks only at the inherited product_type path, not the brand×type intersection — so a product_type that still has products but not for that brand won't be flagged. This does not affect category rename/move detection (when a path empties, all leaves under it — including brand ones — go to 0).
 - **Exact string match.** A filter matches inventory by the **exact** `product_type` string per level. If the filter value and the feed value differ only in **case or whitespace**, it reads as 0. If the first run produces suspiciously many flags, add `trim().toLowerCase()` normalization to both the product levels (`getCampaignInventory`) and the filter values (`buildPath`).
 - **Per-filter join.** The finest (filter-level) traffic check relies on joining `asset_group_product_group_view` to the listing-group filter; this can be brittle for PMax. The **group-level** and **inventory** checks don't use that join and are the robust primary signals. Use `DEBUG` to confirm the per-filter join in your account (if every filter shows `base=0`, the join isn't matching — rely on group/inventory).
 - **`shopping_product` availability.** If it isn't exposed in your Scripts environment, run the equivalent logic via the Google Ads API. Validate first (below).
@@ -187,6 +203,8 @@ while (rows.hasNext()) { Logger.log(JSON.stringify(rows.next())); }
 | `shopping_product` query throws | Resource not available in Scripts for your account/version → use the API, or confirm Merchant Center is linked. |
 | Group shows 0 impressions but `Empty Leaves = 0` and isn't flagged | Correct — its filters still match products, so it's not a broken filter. Investigate bids / budget / ad strength / disapprovals. |
 | No anomaly flags ever | Thresholds too strict / windows too short — lower `*_DROP_PCT` or `*_MIN_BASELINE_IMPRESSIONS`, widen `BASELINE_DAYS`. |
+| Asset group at 0 impressions **not** flagged, but its serving leaf is a *brand* / *"Everything else"* node | Fixed in v4 — the tool now checks every serving leaf against its **inherited** product_type path. Ensure you're on the latest script. |
+| Real 0-product filter missed only because of casing (`ліхтарі` vs `Ліхтарі`) | Keep `NORMALIZE_PRODUCT_TYPE: true` (default) so matching is case/space-insensitive. |
 | Script timeout on large accounts | Split by channel or run different `ENABLE_*` checks on separate schedules. |
 
 ---
@@ -204,6 +222,7 @@ Read-only. The script uses only `AdsApp.search` (GAQL SELECT queries) against Go
 
 ## Changelog
 
+- **v4** — Collect **every** serving leaf and match on the **inherited** product_type path (catches brand / "Everything else" leaves under product_type subdivisions). Added case/whitespace **normalization** (`NORMALIZE_PRODUCT_TYPE`) and group+path de-duplication. Made the **email configurable** (`EMAIL_SHOW_*`, `EMAIL_INVENTORY_HIGH_ONLY`) — default email now sends only broken filters (HIGH) + campaign drops, with a prominent link to the full Sheet.
 - **v3** — Added **per-asset-group / ad-group** anomaly tab, including a timing-independent branch that catches Enabled groups sitting at 0 impressions with empty filters. Added **per-campaign** anomaly tab. Made drop thresholds intuitive (`*_DROP_PCT`). Added `DEBUG`.
 - **v2** — Added **Run History** and **Recurring Breakages** tabs.
 - **v1** — Inventory (0-products) snapshot + per-filter traffic anomaly.
