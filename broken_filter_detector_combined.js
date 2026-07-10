@@ -55,7 +55,15 @@ var SETTINGS = {
 
   // ---- Inventory check ----
   ENABLE_INVENTORY:   true,
-  FLAG_ZERO_ELIGIBLE: true,   // flag filters whose products are all NOT_ELIGIBLE
+  // REVIEW when a path has products but none are IN STOCK — a real problem worth seeing.
+  FLAG_ALL_OUT_OF_STOCK: true,
+  // REVIEW when a path has products but none are ELIGIBLE. Noisy: also fires on
+  // intentionally-excluded combos, so OFF by default.
+  FLAG_ZERO_ELIGIBLE: false,
+  // Suppress rows whose campaign / group name contains any of these (case-insensitive).
+  // Use to hide known service structures you deliberately excluded.
+  IGNORE_CAMPAIGNS_CONTAINING: [],
+  IGNORE_GROUPS_CONTAINING: [],
   NORMALIZE_PRODUCT_TYPE: true, // trim + lowercase when matching (feed has mixed case, e.g. "ліхтарі" vs "Ліхтарі")
 
   // ---- Traffic anomaly: PER-FILTER (catches a single filter breaking) ----
@@ -133,13 +141,17 @@ function main() {
       var seenInv = {}; // dedup: one row per group + product_type path
       for (var i = 0; i < cf.length; i++) {
         var f = cf[i];
+        if (isIgnored(f.campaignName, f.groupName)) continue; // deliberately excluded structures
         var dedupKey = f.groupId + '|' + pathKey(f.pathArray);
         if (seenInv[dedupKey]) continue;
         seenInv[dedupKey] = true;
-        var counts = prefixCounts[pathKey(f.pathArray)] || { total: 0, eligible: 0 };
+        var counts = prefixCounts[pathKey(f.pathArray)] || { total: 0, eligible: 0, inStock: 0 };
         if (counts.total === 0) {
           inventoryFlags.push(invRow(f, counts, 'HIGH',
             'Filter matches 0 products — product_type path not in the campaign feed (likely renamed/moved).'));
+        } else if (SETTINGS.FLAG_ALL_OUT_OF_STOCK && availabilitySupported() && counts.inStock === 0) {
+          inventoryFlags.push(invRow(f, counts, 'REVIEW',
+            counts.total + ' product(s) match but 0 in stock — all out of stock.'));
         } else if (SETTINGS.FLAG_ZERO_ELIGIBLE && counts.eligible === 0) {
           inventoryFlags.push(invRow(f, counts, 'REVIEW',
             'Path exists (' + counts.total + ' product(s)) but 0 ELIGIBLE to serve.'));
@@ -598,12 +610,31 @@ function getShoppingFilters(cid) {
  *  INVENTORY per campaign  (shopping_product)
  * =========================================================================== */
 
+var AVAILABILITY_SUPPORTED = null; // lazily probed once
+
+// Some API versions / Scripts environments may not expose shopping_product.availability.
+// Probe once so a missing field can't break the whole inventory query.
+function availabilitySupported() {
+  if (AVAILABILITY_SUPPORTED !== null) return AVAILABILITY_SUPPORTED;
+  try {
+    var rows = AdsApp.search('SELECT shopping_product.availability FROM shopping_product LIMIT 1');
+    while (rows.hasNext()) { rows.next(); }
+    AVAILABILITY_SUPPORTED = true;
+  } catch (e) {
+    AVAILABILITY_SUPPORTED = false;
+    log('shopping_product.availability not available — out-of-stock REVIEW disabled: ' + e);
+  }
+  return AVAILABILITY_SUPPORTED;
+}
+
 function getCampaignInventory(campaignResource) {
   var prefixCounts = {};
+  var hasAvail = availabilitySupported();
   var q =
     'SELECT shopping_product.product_type_level1, shopping_product.product_type_level2, ' +
     'shopping_product.product_type_level3, shopping_product.product_type_level4, ' +
-    'shopping_product.product_type_level5, shopping_product.status ' +
+    'shopping_product.product_type_level5, shopping_product.status' +
+    (hasAvail ? ', shopping_product.availability ' : ' ') +
     'FROM shopping_product WHERE shopping_product.campaign = "' + campaignResource + '"';
   var rows;
   try { rows = AdsApp.search(q); }
@@ -617,14 +648,18 @@ function getCampaignInventory(campaignResource) {
       get(r, 'shoppingProduct.productTypeLevel5')
     ];
     var isEligible = (get(r, 'shoppingProduct.status') || '').indexOf('ELIGIBLE') === 0;
+    // If availability isn't available, treat every product as "in stock" so the
+    // out-of-stock REVIEW branch never fires on incomplete data.
+    var inStock = hasAvail ? (get(r, 'shoppingProduct.availability') === 'IN_STOCK') : true;
     var parts = [];
     for (var lvl = 0; lvl < levels.length; lvl++) {
       if (!levels[lvl]) break;
       parts.push(levels[lvl]);
       var key = pathKey(parts); // normalized to match filter paths
-      if (!prefixCounts[key]) prefixCounts[key] = { total: 0, eligible: 0 };
+      if (!prefixCounts[key]) prefixCounts[key] = { total: 0, eligible: 0, inStock: 0 };
       prefixCounts[key].total++;
       if (isEligible) prefixCounts[key].eligible++;
+      if (inStock) prefixCounts[key].inStock++;
     }
   }
   return prefixCounts;
@@ -785,6 +820,17 @@ function headerMatches(existing, headers) {
 /* ---- Formatting ---------------------------------------------------------- */
 
 function fillArr(n, v) { var a = []; for (var i = 0; i < n; i++) a.push(v); return a; }
+
+// True if this campaign/group was marked to skip (deliberately-excluded structures).
+function isIgnored(campaignName, groupName) {
+  var cn = String(campaignName || '').toLowerCase();
+  var gn = String(groupName || '').toLowerCase();
+  var cl = SETTINGS.IGNORE_CAMPAIGNS_CONTAINING || [];
+  for (var i = 0; i < cl.length; i++) { if (cl[i] && cn.indexOf(String(cl[i]).toLowerCase()) !== -1) return true; }
+  var gl = SETTINGS.IGNORE_GROUPS_CONTAINING || [];
+  for (var j = 0; j < gl.length; j++) { if (gl[j] && gn.indexOf(String(gl[j]).toLowerCase()) !== -1) return true; }
+  return false;
+}
 
 // Log tabs (Empty Filters / Traffic / Group / Campaign): HIGH red, REVIEW pale,
 // confidence "badge" cell, zebra, run-date separators + muted repeat dates.
