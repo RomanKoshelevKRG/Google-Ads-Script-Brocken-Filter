@@ -113,6 +113,20 @@ The Google Sheet always logs **everything**; these flags only control what the *
 
 Default email = **broken filters (HIGH)** + **campaign drops** + **a link to the full report**.
 
+### Formatting
+| Setting | Default | Purpose |
+|---|---|---|
+| `ENABLE_FORMATTING` | `true` | Colour the sheet after each run (header, HIGH/REVIEW highlight, zebra, run-date separators). |
+
+Colours live in the `STYLE` object near the top of the script (change without touching logic):
+- **HIGH** rows — loud red fill + red confidence badge, so criticals pop instantly.
+- **REVIEW** rows — deliberately pale, so they don't distract from HIGH.
+- **Zebra** striping on neutral rows; **dark header**, frozen.
+- **Run-date separators** — a blue top border between runs; repeated dates within a run are muted so blocks read as groups.
+- **Run History / Recurring** — HIGH counts in red (zeros muted), Total Flags / Times Flagged bold; frequently-recurring paths (≥3 runs) get a red badge.
+
+Formatting re-applies over the whole tab each run using batched calls. On very large logs you can turn it off to save execution time.
+
 ### Inventory (structural)
 | Setting | Default | Purpose |
 |---|---|---|
@@ -222,9 +236,12 @@ Read-only. The script uses only `AdsApp.search` (GAQL SELECT queries) against Go
 
 ## Changelog
 
+- **v5** — Sheet **formatting**: HIGH rows highlighted red, REVIEW kept pale, zebra striping, dark frozen header, run-date separators, and coloured counters in History/Recurring. Palette in the `STYLE` object; toggle via `ENABLE_FORMATTING`.
 - **v4** — Collect **every** serving leaf and match on the **inherited** product_type path (catches brand / "Everything else" leaves under product_type subdivisions). Added case/whitespace **normalization** (`NORMALIZE_PRODUCT_TYPE`) and group+path de-duplication. Made the **email configurable** (`EMAIL_SHOW_*`, `EMAIL_INVENTORY_HIGH_ONLY`) — default email now sends only broken filters (HIGH) + campaign drops, with a prominent link to the full Sheet.
 - **v3** — Added **per-asset-group / ad-group** anomaly tab, including a timing-independent branch that catches Enabled groups sitting at 0 impressions with empty filters. Added **per-campaign** anomaly tab. Made drop thresholds intuitive (`*_DROP_PCT`). Added `DEBUG`.
 - **v2** — Added **Run History** and **Recurring Breakages** tabs.
 - **v1** — Inventory (0-products) snapshot + per-filter traffic anomaly.
 
+## License
 
+MIT (replace with your actual license text before publishing).

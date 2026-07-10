@@ -84,12 +84,27 @@ var SETTINGS = {
   ENABLE_RECURRING:   true,   // rebuild "which categories break repeatedly"
   RECURRING_MIN_RUNS: 2,      // only list paths flagged in >= N distinct runs
 
+  // ---- Sheet formatting (colours, HIGH highlight, run-date separators) ----
+  ENABLE_FORMATTING: true,
+
   // ---- Debug ----
   DEBUG: false,               // true = log baseline/recent impressions per filter & campaign
 };
 // ===========================================================================
 
 var SEP = '\u001f';
+
+// Colour palette for the sheet. HIGH is loud (red), REVIEW is deliberately pale
+// so it doesn't compete for attention. Tune here without touching the logic.
+var STYLE = {
+  HEADER_BG: '#042C53', HEADER_FG: '#FFFFFF',
+  BODY_FG:   '#2C2C2A',
+  HIGH_BG:   '#FCEBEB', HIGH_FG: '#501313', HIGH_BADGE_BG: '#E24B4A', HIGH_BADGE_FG: '#FFFFFF',
+  REVIEW_BG: '#FBF6EC', REVIEW_FG: '#6B5A34', REVIEW_BADGE_BG: '#F1E4C4', REVIEW_BADGE_FG: '#7A5C00',
+  ZEBRA_A:   '#FFFFFF', ZEBRA_B: '#F4F2EC',
+  BLOCK_BORDER: '#378ADD',
+  DATE_MUTED: '#8A8A86', CRIT_TEXT: '#A32D2D', MUTED_TEXT: '#9A9A95'
+};
 
 
 function main() {
@@ -672,6 +687,15 @@ function finish(inventoryFlags, anomalyFlags, groupAnomalyFlags, campaignAnomaly
   if (SETTINGS.ENABLE_HISTORY) writeHistory(ss, stats, runDate);
   if (SETTINGS.ENABLE_RECURRING) rebuildRecurring(ss);
 
+  if (SETTINGS.ENABLE_FORMATTING) {
+    styleLogTab(ss, SETTINGS.INVENTORY_TAB, 2);
+    styleLogTab(ss, SETTINGS.GROUP_ANOMALY_TAB, 2);
+    styleLogTab(ss, SETTINGS.ANOMALY_TAB, 2);
+    styleLogTab(ss, SETTINGS.CAMPAIGN_ANOMALY_TAB, 2);
+    styleHistoryTab(ss, SETTINGS.HISTORY_TAB);
+    styleRecurringTab(ss, SETTINGS.RECURRING_TAB);
+  }
+
   sendEmail(ss, inventoryFlags, groupAnomalyFlags, anomalyFlags, campaignAnomalyFlags);
   log('Done. Sheet: ' + ss.getUrl());
 }
@@ -725,12 +749,163 @@ function rebuildRecurring(ss) {
 function appendRows(ss, tabName, headers, rows) {
   var sheet = ss.getSheetByName(tabName);
   if (!sheet) sheet = ss.insertSheet(tabName);
+
   if (sheet.getLastRow() === 0) {
-    sheet.appendRow(headers);
-    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
-    sheet.setFrozenRows(1);
+    writeHeader(sheet, headers);
+  } else {
+    // Heal a stale header left by an earlier version of the script (new columns
+    // were added, so row 1 no longer matches the current schema).
+    var width = Math.max(sheet.getLastColumn(), headers.length);
+    var existing = sheet.getRange(1, 1, 1, width).getValues()[0];
+    if (!headerMatches(existing, headers)) {
+      sheet.getRange(1, 1, 1, width).clearContent();
+      writeHeader(sheet, headers);
+    }
   }
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
+}
+
+function writeHeader(sheet, headers) {
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+}
+
+function headerMatches(existing, headers) {
+  for (var i = 0; i < headers.length; i++) {
+    var cell = existing[i] == null ? '' : String(existing[i]);
+    if (cell !== headers[i]) return false;
+  }
+  for (var j = headers.length; j < existing.length; j++) {
+    if (existing[j] != null && String(existing[j]) !== '') return false; // stale extra header cell
+  }
+  return true;
+}
+
+/* ---- Formatting ---------------------------------------------------------- */
+
+function fillArr(n, v) { var a = []; for (var i = 0; i < n; i++) a.push(v); return a; }
+
+// Log tabs (Empty Filters / Traffic / Group / Campaign): HIGH red, REVIEW pale,
+// confidence "badge" cell, zebra, run-date separators + muted repeat dates.
+function styleLogTab(ss, tabName, confIdx) {
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 1) return;
+  var nRows = sheet.getLastRow(), nCols = sheet.getLastColumn();
+  var vals = sheet.getRange(1, 1, nRows, nCols).getValues();
+
+  var bg = [fillArr(nCols, STYLE.HEADER_BG)],
+      fc = [fillArr(nCols, STYLE.HEADER_FG)],
+      fw = [fillArr(nCols, 'bold')];
+
+  var prevDate = null, zebra = 0, blockStarts = [];
+  for (var r = 1; r < nRows; r++) {
+    var row = vals[r];
+    var conf = confIdx >= 0 ? String(row[confIdx]) : '';
+    var date = String(row[0]);
+    var blockStart = (date !== prevDate);
+    prevDate = date;
+    if (blockStart) { blockStarts.push(r + 1); zebra = 0; }
+
+    var rbg, rfc, rfw = fillArr(nCols, 'normal');
+    if (conf === 'HIGH')        { rbg = fillArr(nCols, STYLE.HIGH_BG);   rfc = fillArr(nCols, STYLE.HIGH_FG); }
+    else if (conf === 'REVIEW') { rbg = fillArr(nCols, STYLE.REVIEW_BG); rfc = fillArr(nCols, STYLE.REVIEW_FG); }
+    else { rbg = fillArr(nCols, (zebra % 2 === 0) ? STYLE.ZEBRA_A : STYLE.ZEBRA_B); rfc = fillArr(nCols, STYLE.BODY_FG); zebra++; }
+
+    if (confIdx >= 0 && conf === 'HIGH')   { rbg[confIdx] = STYLE.HIGH_BADGE_BG;   rfc[confIdx] = STYLE.HIGH_BADGE_FG;   rfw[confIdx] = 'bold'; }
+    if (confIdx >= 0 && conf === 'REVIEW') { rbg[confIdx] = STYLE.REVIEW_BADGE_BG; rfc[confIdx] = STYLE.REVIEW_BADGE_FG; rfw[confIdx] = 'bold'; }
+
+    if (blockStart) rfw[0] = 'bold'; else rfc[0] = STYLE.DATE_MUTED;
+
+    bg.push(rbg); fc.push(rfc); fw.push(rfw);
+  }
+
+  var rng = sheet.getRange(1, 1, nRows, nCols);
+  rng.setBackgrounds(bg); rng.setFontColors(fc); rng.setFontWeights(fw);
+  if (nRows > 1 && nCols > 1) sheet.getRange(2, 2, nRows - 1, nCols - 1).setNumberFormat('#,##0');
+  sheet.setFrozenRows(1);
+
+  for (var b = 0; b < blockStarts.length; b++) {
+    var br = blockStarts[b];
+    if (br > 2) sheet.getRange(br, 1, 1, nCols)
+      .setBorder(true, null, null, null, null, null, STYLE.BLOCK_BORDER, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  }
+}
+
+// Run History: zebra, HIGH counts in red (0 = muted), Total Flags bold.
+function styleHistoryTab(ss, tabName) {
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 1) return;
+  var nRows = sheet.getLastRow(), nCols = sheet.getLastColumn();
+  var vals = sheet.getRange(1, 1, nRows, nCols).getValues();
+  var header = vals[0];
+
+  var bg = [fillArr(nCols, STYLE.HEADER_BG)],
+      fc = [fillArr(nCols, STYLE.HEADER_FG)],
+      fw = [fillArr(nCols, 'bold')];
+
+  for (var r = 1; r < nRows; r++) {
+    var rbg = fillArr(nCols, (r % 2 === 1) ? STYLE.ZEBRA_A : STYLE.ZEBRA_B);
+    var rfc = fillArr(nCols, STYLE.BODY_FG);
+    var rfw = fillArr(nCols, 'normal');
+    rfw[0] = 'bold';
+    for (var c = 1; c < nCols; c++) {
+      var h = String(header[c]);
+      if (/HIGH/.test(h)) {
+        if (Number(vals[r][c]) > 0) { rfc[c] = STYLE.CRIT_TEXT; rfw[c] = 'bold'; }
+        else { rfc[c] = STYLE.MUTED_TEXT; }
+      } else if (/Total Flags/.test(h)) {
+        rfw[c] = 'bold';
+      }
+    }
+    bg.push(rbg); fc.push(rfc); fw.push(rfw);
+  }
+
+  var rng = sheet.getRange(1, 1, nRows, nCols);
+  rng.setBackgrounds(bg); rng.setFontColors(fc); rng.setFontWeights(fw);
+  if (nRows > 1 && nCols > 1) sheet.getRange(2, 2, nRows - 1, nCols - 1).setNumberFormat('#,##0');
+  sheet.setFrozenRows(1);
+}
+
+// Recurring Breakages: zebra, "Times Flagged" intensity (>=3 = red badge), coloured Last Confidence.
+function styleRecurringTab(ss, tabName) {
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 1) return;
+  var nRows = sheet.getLastRow(), nCols = sheet.getLastColumn();
+  var vals = sheet.getRange(1, 1, nRows, nCols).getValues();
+  var header = vals[0];
+  var timesIdx = -1, confIdx = -1;
+  for (var c = 0; c < nCols; c++) {
+    var h = String(header[c]);
+    if (/Times Flagged/.test(h)) timesIdx = c;
+    if (/Last Confidence/.test(h)) confIdx = c;
+  }
+
+  var bg = [fillArr(nCols, STYLE.HEADER_BG)],
+      fc = [fillArr(nCols, STYLE.HEADER_FG)],
+      fw = [fillArr(nCols, 'bold')];
+
+  for (var r = 1; r < nRows; r++) {
+    var rbg = fillArr(nCols, (r % 2 === 1) ? STYLE.ZEBRA_A : STYLE.ZEBRA_B);
+    var rfc = fillArr(nCols, STYLE.BODY_FG);
+    var rfw = fillArr(nCols, 'normal');
+    if (timesIdx >= 0) {
+      var t = Number(vals[r][timesIdx]);
+      rfw[timesIdx] = 'bold';
+      if (t >= 3) { rbg[timesIdx] = STYLE.HIGH_BADGE_BG; rfc[timesIdx] = STYLE.HIGH_BADGE_FG; }
+      else { rfc[timesIdx] = STYLE.CRIT_TEXT; }
+    }
+    if (confIdx >= 0) {
+      var cv = String(vals[r][confIdx]);
+      if (cv === 'HIGH') { rfc[confIdx] = STYLE.HIGH_FG; rfw[confIdx] = 'bold'; }
+      else if (cv === 'REVIEW') { rfc[confIdx] = STYLE.REVIEW_FG; }
+    }
+    bg.push(rbg); fc.push(rfc); fw.push(rfw);
+  }
+
+  var rng = sheet.getRange(1, 1, nRows, nCols);
+  rng.setBackgrounds(bg); rng.setFontColors(fc); rng.setFontWeights(fw);
+  sheet.setFrozenRows(1);
 }
 
 function sendEmail(ss, invFlags, grpFlags, anoFlags, campFlags) {
